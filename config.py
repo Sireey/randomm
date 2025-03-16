@@ -1,6 +1,6 @@
 class Config:
     def __init__(self):
-        self.vocab_size = 8766  # Update this to the size of the Telugu vocabulary
+        self.vocab_size = 8766  # Size from your preprocessing output
         self.embed_dim = 768
         self.num_heads = 12
         self.seq_len = 512
@@ -10,4 +10,5 @@ class Config:
         self.mlp_ratio = 4
         self.mlp_dropout = 0.1
         self.depth = 12
-        self.eos_token_id = 3  # Add EOS token ID if necessary
+        self.bos_token_id = 2  # <s> token ID
+        self.eos_token_id = 3  # </s> token ID
