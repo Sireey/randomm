@@ -1,3 +1,6 @@
+from config import Config
+from model import VisionGPT2Model
+from preprocessing import TeluguDataset, build_vocab, collate_fn, load_telugu_captions, train_tfms
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -5,17 +8,24 @@ from torch.utils.data import DataLoader, random_split, Subset
 from tqdm import tqdm
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
-from preprocessing import TeluguDataset, build_vocab, collate_fn, load_telugu_captions, train_tfms
-from model import VisionGPT2Model
-from config import Config
-from pathlib import Path
+from google.colab import drive
+import sys
+import os
+import random
 import pandas as pd
 import numpy as np
 import gc
 from types import SimpleNamespace
 from PIL import Image
-import os
-import random
+import matplotlib.pyplot as plt
+import seaborn as sns
+from transformers import get_linear_schedule_with_warmup
+
+
+# Add project files to path
+sys.path.append("/content/drive/MyDrive/Project_files")
+
+# Import your modules
 
 
 def prepare_reduced_data(caption_path, image_dir, max_samples=500, val_split=0.1):
@@ -80,6 +90,7 @@ class Trainer:
         self.train_config = train_config
         self.model_config = model_config
         self.device = self.train_config.device
+        self.current_epoch = 0
 
         # Initialize model
         self.model = VisionGPT2Model.from_pretrained(
@@ -93,30 +104,29 @@ class Trainer:
 
         self.train_dl, self.val_dl = dls
 
-        # Optimizer with weight decay
+        # Initialize optimizer and scheduler
         self.optim = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.train_config.lr / 25.0,
+            [p for p in self.model.parameters() if p.requires_grad],
+            lr=self.train_config.lr,
             weight_decay=0.01
         )
 
-        # Learning rate scheduler
-        self.sched = torch.optim.lr_scheduler.OneCycleLR(
+        # Create a scheduler - linear warmup followed by cosine decay
+        self.sched = get_linear_schedule_with_warmup(
             self.optim,
-            max_lr=self.train_config.lr,
-            epochs=self.train_config.epochs,
-            steps_per_epoch=len(self.train_dl),
-            pct_start=0.1,
-            div_factor=25.0,
-            final_div_factor=10000.0
+            # 2 epochs of warmup
+            num_warmup_steps=len(self.train_dl) * 2 if self.train_dl else 100,
+            num_training_steps=len(
+                self.train_dl) * self.train_config.epochs if self.train_dl else 1000
         )
 
-        # Track metrics
-        self.metrics = pd.DataFrame()
-        self.metrics[['train_loss', 'train_perplexity',
-                      'val_loss', 'val_perplexity']] = None
+        # Initialize metrics dataframe with expanded metrics
+        self.metrics = pd.DataFrame(columns=[
+            'train_loss', 'train_perplexity', 'val_loss', 'val_perplexity',
+            'lr', 'unfrozen_layers'
+        ])
 
-        # Transforms for inference
+        # Define transformations for caption generation
         self.gen_tfms = A.Compose([
             A.Resize(224, 224),
             A.Normalize(mean=[0.5, 0.5, 0.5], std=[
@@ -124,38 +134,74 @@ class Trainer:
             ToTensorV2()
         ])
 
+        # Create directory for model checkpoints
+        os.makedirs(self.train_config.model_path, exist_ok=True)
+
+        # Create attention maps directory if specified
+        if hasattr(self.train_config, 'attention_maps_path'):
+            os.makedirs(self.train_config.attention_maps_path, exist_ok=True)
+
+        # Keep track of current lr and unfrozen layer info
+        self.current_lr = self.train_config.lr
+        self.unfrozen_layers = "None (Only projection layers)"
+
     def save_model(self, epoch=None):
         """Save model checkpoint"""
-        self.train_config.model_path.mkdir(exist_ok=True)
-
         if epoch is not None:
-            save_path = self.train_config.model_path / \
-                f'captioner_epoch_{epoch}.pt'
+            save_path = os.path.join(
+                self.train_config.model_path, f'captioner_epoch_{epoch}.pt')
         else:
-            save_path = self.train_config.model_path / 'captioner_best.pt'
+            save_path = os.path.join(
+                self.train_config.model_path, 'captioner_best.pt')
+
+        # Save model state dict separately to reduce memory usage during saving
+        model_state = self.model.state_dict()
 
         state_dict = {
-            'model': self.model.state_dict(),
+            'model': model_state,
             'optimizer': self.optim.state_dict(),
             'scheduler': self.sched.state_dict(),
-            'metrics': self.metrics
+            'metrics': self.metrics,
+            'epoch': self.current_epoch if epoch is None else epoch,  # Changed line
+            'vocab_size': self.model_config.vocab_size
         }
 
+        print(f"Saving checkpoint to {save_path}...")
         torch.save(state_dict, save_path)
-        print(f"Model saved to {save_path}")
+        print(f"Model saved successfully")
 
-    def load_best_model(self):
-        """Load the best checkpoint"""
+    def load_checkpoint(self, path=None):
+        """Load model checkpoint"""
+        if path is None:
+            path = os.path.join(
+                self.train_config.model_path, 'captioner_best.pt')
+
         try:
+            print(f"Loading checkpoint from {path}")
+            # Load checkpoint to CPU first to avoid OOM on GPU
             checkpoint = torch.load(
-                self.train_config.model_path / 'captioner_best.pt',
-                map_location=self.device)
+                path, map_location='cpu', weights_only=False)
+
+            # Load model state dict
             self.model.load_state_dict(checkpoint['model'])
-            print("Loaded best model checkpoint")
-            return True
-        except:
-            print("Failed to load checkpoint")
-            return False
+
+            # Move model to proper device after loading
+            self.model = self.model.to(self.device)
+
+            # Load optimizer and scheduler states
+            self.optim.load_state_dict(checkpoint['optimizer'])
+            self.sched.load_state_dict(checkpoint['scheduler'])
+
+            # Load metrics
+            if 'metrics' in checkpoint:
+                self.metrics = checkpoint['metrics']
+
+            loaded_epoch = checkpoint.get('epoch', -1)
+            print(f"Successfully loaded checkpoint (epoch {loaded_epoch})")
+            return True, loaded_epoch
+        except Exception as e:
+            print(f"Failed to load checkpoint: {e}")
+            return False, -1
 
     def train_one_epoch(self, epoch):
         """Train for one epoch"""
@@ -175,7 +221,8 @@ class Trainer:
             loss.backward()
 
             # Gradient clipping to prevent explosion
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(
+                [p for p in self.model.parameters() if p.requires_grad], 1.0)
 
             self.optim.step()
             self.sched.step()
@@ -184,16 +231,24 @@ class Trainer:
             running_loss += loss.item()
 
             prog.set_description(
-                f'Epoch {epoch} | Train Loss: {loss.item():.3f}')
+                f'Epoch {epoch} | Train Loss: {loss.item():.3f} | LR: {self.optim.param_groups[0]["lr"]:.1e}')
 
+            # Free up memory
             del image, input_ids, labels, loss
+            self.clean()
 
         train_loss = running_loss / len(self.train_dl)
         # Cap perplexity to avoid overflow
         train_pxp = np.exp(min(train_loss, 20))
 
-        self.metrics.loc[epoch, ['train_loss', 'train_perplexity']] = (
-            train_loss, train_pxp)
+        # Get current learning rate
+        current_lr = self.optim.param_groups[0]['lr']
+
+        self.metrics.loc[epoch, ['train_loss', 'train_perplexity', 'lr', 'unfrozen_layers']] = (
+            train_loss, train_pxp, current_lr, self.unfrozen_layers)
+
+        self.current_epoch = epoch
+
         return train_loss
 
     @torch.no_grad()
@@ -214,7 +269,9 @@ class Trainer:
             prog.set_description(
                 f'Epoch {epoch} | Valid Loss: {loss.item():.3f}')
 
+            # Free up memory
             del image, input_ids, labels, loss
+            self.clean()
 
         val_loss = running_loss / len(self.val_dl)
         val_pxp = np.exp(min(val_loss, 20))  # Cap perplexity to avoid overflow
@@ -224,49 +281,393 @@ class Trainer:
 
         return val_loss, val_pxp
 
+    def generate_sample_caption(self, image_path):
+        """Generate caption for a sample image"""
+        self.model.eval()
+
+        # Load and process image
+        image = Image.open(image_path).convert('RGB')
+        image_np = np.array(image)
+        transformed_image = self.gen_tfms(image=image_np)['image']
+        image_tensor = transformed_image.unsqueeze(0).to(self.device)
+
+        # Start with BOS token
+        input_ids = torch.tensor(
+            [[self.model_config.bos_token_id]]).to(self.device)
+
+        # Generate text
+        with torch.no_grad():
+            caption_ids = self.model.generate(
+                image_tensor,
+                input_ids,
+                max_tokens=20,
+                temperature=1.2,
+                repetition_penalty=1.5,
+                deterministic=False
+            )
+
+            print("Generation process:")
+            for i in range(caption_ids.shape[1]):
+                token_id = caption_ids[0, i].item()  # Get token ID
+                token_word = idx_to_word.get(
+                    token_id, "<unk>")  # Get corresponding word
+                print(
+                    f"Step {i}: Selected token ID {token_id} → '{token_word}'")
+
+        # Convert IDs back to tokens
+        dataset = self.train_dl.dataset if self.train_dl else None
+        if dataset is None and self.val_dl:
+            dataset = self.val_dl.dataset
+
+        if dataset is None:
+            # If we don't have dataset information, we can't convert IDs to tokens
+            return "[No vocabulary available to decode caption]"
+
+        if isinstance(dataset, Subset):
+            dataset = dataset.dataset
+        idx_to_word = {idx: word for word, idx in dataset.vocab.items()}
+
+        tokens = [idx_to_word.get(idx, "<unk>") for idx in caption_ids.squeeze().tolist()
+                  if idx not in [0, 1, 2, 3]]  # Skip special tokens
+
+        caption = " ".join(tokens)
+        return caption
+
+    @torch.no_grad()
+    def visualize_attention(self, image_path, epoch):
+        """
+        Generate caption and visualize attention weights
+        Returns the generated caption
+        """
+        self.model.eval()
+
+        # Check if attention_maps_path is set
+        if not hasattr(self.train_config, 'attention_maps_path'):
+            print("Attention maps path not set. Skipping attention visualization.")
+            return self.generate_sample_caption(image_path)
+
+        # Load and process image
+        try:
+            image = Image.open(image_path).convert('RGB')
+            original_image = np.array(image)
+            transformed_image = self.gen_tfms(image=original_image)['image']
+            image_tensor = transformed_image.unsqueeze(0).to(self.device)
+        except Exception as e:
+            print(f"Error loading image {image_path}: {e}")
+            return f"[Error loading image: {str(e)}]"
+
+        # Start with BOS token
+        input_ids = torch.tensor(
+            [[self.model_config.bos_token_id]]).to(self.device)
+
+        try:
+            # Check if generate_with_attention method exists in the model
+            if hasattr(self.model, 'generate_with_attention'):
+                # Generate text with attention weights
+                caption_ids, attention_weights = self.model.generate_with_attention(
+                    image_tensor,
+                    input_ids,
+                    max_tokens=20,
+                    temperature=1.0,
+                    deterministic=True
+                )
+            else:
+                # Fall back to regular generation if attention visualization is not available
+                print(
+                    "Model doesn't support attention visualization. Using regular generation.")
+                caption_ids = self.model.generate(
+                    image_tensor,
+                    input_ids,
+                    max_tokens=20,
+                    temperature=1.0,
+                    deterministic=True
+                )
+                return self.generate_sample_caption(image_path)
+        except Exception as e:
+            print(f"Error generating caption: {e}")
+            return f"[Error generating caption: {str(e)}]"
+
+        # Convert IDs back to tokens
+        dataset = self.train_dl.dataset if self.train_dl else None
+        if dataset is None and self.val_dl:
+            dataset = self.val_dl.dataset
+
+        if dataset is None:
+            # If we don't have dataset information, we can't convert IDs to tokens
+            return "[No vocabulary available to decode caption]"
+
+        if isinstance(dataset, Subset):
+            dataset = dataset.dataset
+        idx_to_word = {idx: word for word, idx in dataset.vocab.items()}
+
+        tokens = [idx_to_word.get(idx, "<unk>") for idx in caption_ids.squeeze().tolist()
+                  if idx not in [0, 1, 2, 3]]  # Skip special tokens
+
+        caption = " ".join(tokens)
+
+        # Now create attention visualization if we have attention weights
+        try:
+            if 'attention_weights' in locals() and attention_weights is not None:
+                img_name = os.path.basename(image_path).split('.')[0]
+                epoch_str = str(epoch)
+                save_dir = os.path.join(
+                    self.train_config.attention_maps_path, f"epoch_{epoch_str}")
+                os.makedirs(save_dir, exist_ok=True)
+
+                # Save attention maps
+                for i, attn in enumerate(attention_weights):
+                    # Reshape attention for visualization
+                    # This depends on your model's architecture
+                    # Example: Reshape and normalize attention
+                    attn_map = attn.cpu().numpy()
+
+                    # Create figure
+                    fig, ax = plt.subplots(figsize=(10, 10))
+                    ax.imshow(original_image)
+                    ax.imshow(attn_map, cmap='hot', alpha=0.5)
+                    ax.axis('off')
+
+                    # Add token information if available
+                    if i < len(tokens):
+                        ax.set_title(f"Attention for token: {tokens[i]}")
+
+                    plt.tight_layout()
+                    plt.savefig(os.path.join(
+                        save_dir, f"{img_name}_token_{i}.png"))
+                    plt.close()
+        except Exception as e:
+            print(f"Error visualizing attention: {e}")
+
+        return caption
+
     def clean(self):
         """Clean memory"""
         gc.collect()
+        if self.device.type == 'cuda':
+            torch.cuda.empty_cache()
 
-    def fit(self):
-        """Training loop"""
+    def plot_training_metrics(self):
+        """Plot training and validation metrics"""
+        if len(self.metrics) < 2:
+            print("Not enough data to plot metrics")
+            return
+
+        fig, axs = plt.subplots(2, 2, figsize=(15, 12))
+
+        # Plot loss
+        axs[0, 0].plot(self.metrics['train_loss'], label='Train Loss')
+        axs[0, 0].plot(self.metrics['val_loss'], label='Val Loss')
+        axs[0, 0].set_title('Loss')
+        axs[0, 0].set_xlabel('Epoch')
+        axs[0, 0].set_ylabel('Loss')
+        axs[0, 0].legend()
+        axs[0, 0].grid(True)
+
+        # Plot perplexity
+        axs[0, 1].plot(self.metrics['train_perplexity'],
+                       label='Train Perplexity')
+        axs[0, 1].plot(self.metrics['val_perplexity'], label='Val Perplexity')
+        axs[0, 1].set_title('Perplexity')
+        axs[0, 1].set_xlabel('Epoch')
+        axs[0, 1].set_ylabel('Perplexity')
+        axs[0, 1].legend()
+        axs[0, 1].grid(True)
+
+        # Plot learning rate
+        axs[1, 0].plot(self.metrics['lr'])
+        axs[1, 0].set_title('Learning Rate')
+        axs[1, 0].set_xlabel('Epoch')
+        axs[1, 0].set_ylabel('Learning Rate')
+        axs[1, 0].set_yscale('log')
+        axs[1, 0].grid(True)
+
+        # Plot unfrozen layers info as text
+        axs[1, 1].axis('off')
+        unfrozen_text = "Unfrozen Layers by Epoch:\n\n"
+        for i, layer_info in enumerate(self.metrics['unfrozen_layers']):
+            unfrozen_text += f"Epoch {i}: {layer_info}\n"
+        axs[1, 1].text(0.1, 0.5, unfrozen_text, fontsize=10, va='center')
+
+        plt.tight_layout()
+
+        # Save figure
+        metrics_path = os.path.join(
+            self.train_config.model_path, 'training_metrics.png')
+        plt.savefig(metrics_path)
+        plt.close()
+
+        print(f"Training metrics plot saved to {metrics_path}")
+
+    def generate_val_captions(self, epoch, num_samples=5):
+        """Generate captions for a few validation samples"""
+        if self.val_dl is None or len(self.val_dl.dataset) == 0:
+            print("No validation samples available")
+            return
+
+        val_size = len(self.val_dl.dataset)
+        sample_indices = random.sample(
+            range(val_size), min(num_samples, val_size))
+
+        print(f"\n=== Validation Captions at Epoch {epoch} ===")
+
+        captions = []
+        for idx in sample_indices:
+            try:
+                sample = self.val_dl.dataset[idx]
+
+                # Get image path from dataset
+                if isinstance(self.val_dl.dataset, Subset):
+                    img_path = self.val_dl.dataset.dataset.df.iloc[
+                        self.val_dl.dataset.indices[idx]]['image']
+                    true_caption = self.val_dl.dataset.dataset.df.iloc[
+                        self.val_dl.dataset.indices[idx]]['caption']
+                else:
+                    img_path = self.val_dl.dataset.df.iloc[idx]['image']
+                    true_caption = self.val_dl.dataset.df.iloc[idx]['caption']
+
+                # Generate caption with attention if possible
+                gen_caption = self.visualize_attention(img_path, epoch)
+
+                print(f"Image: {os.path.basename(img_path)}")
+                print(f"True caption: {true_caption}")
+                print(f"Generated: {gen_caption}")
+                print("-" * 50)
+
+                captions.append({
+                    'image': os.path.basename(img_path),
+                    'true_caption': true_caption,
+                    'generated_caption': gen_caption
+                })
+            except Exception as e:
+                print(f"Error processing validation sample {idx}: {e}")
+
+        # Save captions to file
+        try:
+            captions_path = os.path.join(
+                self.train_config.model_path, f'val_captions_epoch_{epoch}.json')
+
+            import json
+            with open(captions_path, 'w', encoding='utf-8') as f:
+                json.dump(captions, f, ensure_ascii=False, indent=2)
+
+            print(f"Validation captions saved to {captions_path}")
+        except Exception as e:
+            print(f"Error saving validation captions: {e}")
+
+    def fit(self, start_epoch=0):
+        """Training loop with gradual unfreezing and validation caption generation"""
         best_loss = float('inf')
+        if not self.metrics.empty and 'val_loss' in self.metrics:
+            # Find the previous best loss
+            min_loss = self.metrics['val_loss'].min()
+            if not pd.isna(min_loss):
+                best_loss = min_loss
+                print(f"Previous best validation loss: {best_loss:.4f}")
+
         best_epoch = -1
-        prog = tqdm(range(self.train_config.epochs), desc="Epochs")
+        epochs_range = range(start_epoch, self.train_config.epochs)
+        prog = tqdm(epochs_range, desc="Epochs")
+
+        # Define unfreezing schedule (more gradual)
+        unfreezing_schedule = {
+            # Starting point: No unfreezing
+            0: ("None (Only projection layers)", 1.0),
+            # Unfreeze last GPT2 block
+            2: ("Last GPT2 block", 0.8),
+            # Unfreeze last 2 GPT2 blocks
+            4: ("Last 2 GPT2 blocks", 0.5),
+            # Unfreeze all GPT2 blocks
+            6: ("All GPT2 blocks", 0.3),
+            8: ("All layers", 0.1)                     # Unfreeze everything
+        }
 
         for epoch in prog:
-            # Progressive unfreezing based on epochs
-            if epoch == self.train_config.freeze_epochs_gpt:
-                self.model.unfreeze_gpt_layers()
-                print('Unfreezing GPT2 layers...')
+            # Check if this epoch needs layer unfreezing according to schedule
+            if epoch in unfreezing_schedule:
+                layer_desc, lr_factor = unfreezing_schedule[epoch]
+                self.unfrozen_layers = layer_desc
 
-            if epoch == self.train_config.freeze_epochs_all:
-                self.model.pretrained_layers_trainable(trainable=True)
-                print('Unfreezing all layers...')
+                # Adjust model layers according to unfreezing stage
+                if layer_desc == "Last GPT2 block":
+                    self.model.unfreeze_last_gpt_block()
+                    print(f'Unfreezing last GPT2 block...')
+                elif layer_desc == "Last 2 GPT2 blocks":
+                    self.model.unfreeze_last_n_gpt_blocks(2)
+                    print(f'Unfreezing last 2 GPT2 blocks...')
+                elif layer_desc == "All GPT2 blocks":
+                    self.model.unfreeze_gpt_layers()
+                    print(f'Unfreezing all GPT2 layers...')
+                elif layer_desc == "All layers":
+                    self.model.pretrained_layers_trainable(trainable=True)
+                    print(f'Unfreezing all layers...')
 
-            # Training phase
-            train_loss = self.train_one_epoch(epoch)
-            self.clean()
+                # Update learning rate based on schedule factor
+                new_lr = self.train_config.lr * lr_factor
+                print(f'Adjusting learning rate to {new_lr:.1e}')
 
-            # Validation phase
-            val_loss, val_ppl = self.valid_one_epoch(epoch)
-            self.clean()
+                # Re-initialize optimizer with updated learning rate
+                self.optim = torch.optim.AdamW(
+                    [p for p in self.model.parameters() if p.requires_grad],
+                    lr=new_lr,
+                    weight_decay=0.01
+                )
 
-            # Save checkpoint every few epochs
-            if (epoch + 1) % 2 == 0:  # Save more frequently on small dataset
+                # Re-initialize scheduler
+                remaining_epochs = self.train_config.epochs - epoch
+                self.sched = get_linear_schedule_with_warmup(
+                    self.optim,
+                    num_warmup_steps=len(self.train_dl),  # 1 epoch warmup
+                    num_training_steps=len(self.train_dl) * remaining_epochs
+                )
+
+                # Update current learning rate tracking
+                self.current_lr = new_lr
+
+            try:
+                # Training phase
+                train_loss = self.train_one_epoch(epoch)
+                self.clean()
+
+                # Validation phase
+                val_loss, val_ppl = self.valid_one_epoch(epoch)
+                self.clean()
+
+                # Generate validation captions and visualize attention maps every 2 epochs
+                if epoch % 2 == 0 or epoch == self.train_config.epochs - 1:
+                    self.generate_val_captions(epoch)
+
+                # Save checkpoint every epoch
                 self.save_model(epoch=epoch)
 
-            # Print metrics
-            print(
-                f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_ppl:.4f}")
+                # Plot and save metrics
+                self.plot_training_metrics()
 
-            # Save best model
-            if val_loss < best_loss:
-                best_loss = val_loss
-                best_epoch = epoch
+                # Print metrics
                 print(
-                    f'New best model at epoch {epoch} with validation loss: {val_loss:.4f}')
-                self.save_model()
+                    f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_ppl:.4f}")
+
+                # Save best model
+                if val_loss < best_loss:
+                    best_loss = val_loss
+                    best_epoch = epoch
+                    print(
+                        f'New best model at epoch {epoch} with validation loss: {val_loss:.4f}')
+                    self.save_model()
+            except Exception as e:
+                print(f"Error during epoch {epoch}: {e}")
+                # Try to save current model state in case of error
+                try:
+                    self.save_model(epoch=f"{epoch}_error")
+                except:
+                    pass
+
+        # Final attention maps visualization on best model
+        print("\nGenerating final attention maps with best model...")
+        try:
+            self.load_checkpoint()  # Load best model
+            self.generate_val_captions(epoch="final", num_samples=10)
+        except Exception as e:
+            print(f"Error generating final visualizations: {e}")
 
         return {
             'best_loss': best_loss,
@@ -279,32 +680,47 @@ class Trainer:
         """Generate caption for an image"""
         self.model.eval()
 
-        image = Image.open(image_path).convert('RGB')
-        image = np.array(image)
-        image = self.gen_tfms(image=image)['image']
-        image = image.unsqueeze(0).to(self.device)
+        try:
+            image = Image.open(image_path).convert('RGB')
+            image = np.array(image)
+            image = self.gen_tfms(image=image)['image']
+            image = image.unsqueeze(0).to(self.device)
 
-        # Start with BOS token
-        sequence = torch.tensor(
-            [[self.model_config.bos_token_id]]).to(self.device)
+            # Start with BOS token
+            sequence = torch.tensor(
+                [[self.model_config.bos_token_id]]).to(self.device)
 
-        # Generate caption
-        caption_ids = self.model.generate(
-            image,
-            sequence,
-            max_tokens=max_tokens,
-            temperature=temperature,
-            deterministic=deterministic
-        )
+            # Generate caption
+            caption_ids = self.model.generate(
+                image,
+                sequence,
+                max_tokens=max_tokens,
+                temperature=temperature,
+                deterministic=deterministic
+            )
 
-        # Convert IDs back to tokens
-        idx_to_word = {idx: word for word,
-                       idx in self.train_dl.dataset.dataset.vocab.items()}
-        tokens = [idx_to_word.get(idx, "<unk>") for idx in caption_ids.tolist()
-                  if idx not in [0, 1, 2, 3]]  # Skip special tokens
+            # Convert IDs back to tokens
+            dataset = self.train_dl.dataset if self.train_dl else None
+            if dataset is None and self.val_dl:
+                dataset = self.val_dl.dataset
 
-        caption = " ".join(tokens)
-        return caption
+            if dataset is None:
+                # If we don't have dataset information, we can't convert IDs to tokens
+                return "[No vocabulary available to decode caption]"
+
+            # Handle Subset case
+            if isinstance(dataset, Subset):
+                dataset = dataset.dataset
+            idx_to_word = {idx: word for word, idx in dataset.vocab.items()}
+
+            tokens = [idx_to_word.get(idx, "<unk>") for idx in caption_ids.squeeze().tolist()
+                      if idx not in [0, 1, 2, 3]]  # Skip special tokens
+
+            caption = " ".join(tokens)
+            return caption
+        except Exception as e:
+            print(f"Error generating caption: {e}")
+            return f"[Error: {str(e)}]"
 
 
 def main():
@@ -313,107 +729,133 @@ def main():
     torch.manual_seed(42)
     np.random.seed(42)
 
-    # Set up device - use CPU
-    device = torch.device('cpu')
-    print(f"Using device: {device}")
+    # Mount Google Drive if not already mounted
+    if not os.path.exists('/content/drive'):
+        drive.mount('/content/drive')
+
+    # Check for CUDA
+    if torch.cuda.is_available():
+        device = torch.device('cuda')
+        print(f"Using CUDA GPU: {torch.cuda.get_device_name(0)}")
+        print(f"CUDA Device Count: {torch.cuda.device_count()}")
+        print(
+            f"CUDA Memory Allocated: {torch.cuda.memory_allocated(0) / 1e9:.2f} GB")
+        print(
+            f"CUDA Memory Reserved: {torch.cuda.memory_reserved(0) / 1e9:.2f} GB")
+    else:
+        print("WARNING: CUDA not available. Using CPU instead.")
+        device = torch.device('cpu')
 
     # Configuration
     model_config = Config()
 
+    # Your specific paths
+    data_path = "/content/drive/MyDrive/randomm/Data/fl8telugu.txt"
+    images_folder = "/content/drive/MyDrive/randomm/Data/Images"
+
+    # Define training configuration
     train_config = SimpleNamespace(
-        epochs=5,               # Keep original 5 epochs
-        freeze_epochs_gpt=2,
-        freeze_epochs_all=3,
+        epochs=10,  # Increased from 5 to 10
         lr=2e-5,
         device=device,
-        model_path=Path('telugu_captioner_test'),
+        model_path='/content/drive/MyDrive/randomm/telugu_captioner_checkpoints',
+        attention_maps_path='/content/drive/MyDrive/randomm/attention_maps',
         batch_size=4,
-        num_workers=0
+        num_workers=2
     )
 
-    # Prepare reduced data - just 100 images for testing
-    caption_path = "D:/ict/Data/fl8telugu.txt"
-    image_dir = "D:/ict/Data/Images/"
+    # Check if files exist
+    if not os.path.exists(data_path):
+        print(f"ERROR: Caption file not found at {data_path}")
+        return
 
+    if not os.path.exists(images_folder):
+        print(f"ERROR: Images folder not found at {images_folder}")
+        return
+
+    # Prepare dataset with reduced samples for faster experimentation
     train_ds, val_ds, vocab = prepare_reduced_data(
-        caption_path, image_dir, max_samples=100, val_split=0.1)
+        caption_path=data_path,
+        image_dir=images_folder,
+        max_samples=500,  # Limit to 500 samples
+        val_split=0.1
+    )
 
+    # Update vocab size in model config
     model_config.vocab_size = len(vocab)
     print(f"Vocabulary size: {model_config.vocab_size}")
 
-    model_config.depth = 12  # Full GPT2 depth for pretrained compatibility
-
+    # Create data loaders
     train_dl = DataLoader(
         train_ds,
         batch_size=train_config.batch_size,
         shuffle=True,
-        num_workers=0,
-        collate_fn=collate_fn
+        num_workers=train_config.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True if device.type == 'cuda' else False
     )
 
     val_dl = DataLoader(
         val_ds,
         batch_size=train_config.batch_size,
         shuffle=False,
-        num_workers=0,
-        collate_fn=collate_fn
+        num_workers=train_config.num_workers,
+        collate_fn=collate_fn,
+        pin_memory=True if device.type == 'cuda' else False
     )
 
+    # Initialize trainer
     trainer = Trainer(model_config, train_config, (train_dl, val_dl))
 
     # Check for existing checkpoint
-    checkpoint_path = Path('telugu_captioner_test') / 'captioner_best.pt'
-    if checkpoint_path.exists():
-        print(f"Found checkpoint at {checkpoint_path}, resuming training...")
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        trainer.model.load_state_dict(checkpoint['model'])
-        trainer.optim.load_state_dict(checkpoint['optimizer'])
-        trainer.sched.load_state_dict(checkpoint['scheduler'])
-        trainer.metrics = checkpoint['metrics']
+    start_epoch = 0
+    checkpoint_path = os.path.join(
+        train_config.model_path, 'captioner_best.pt')
+    if os.path.exists(checkpoint_path):
+        print(f"Found existing checkpoint at {checkpoint_path}")
+        success, loaded_epoch = trainer.load_checkpoint(checkpoint_path)
+        if success and loaded_epoch >= 0:
+            start_epoch = loaded_epoch + 1
+            print(f"Resuming training from epoch {start_epoch}")
 
-        print("Running final epoch (5)...")
-        epoch = 4  # 0-indexed
-
-        train_loss = trainer.train_one_epoch(epoch)
-        trainer.clean()
-
-        val_loss, val_ppl = trainer.valid_one_epoch(epoch)
-        trainer.clean()
-
-        print(
-            f"Epoch {epoch}: Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}, Val Perplexity: {val_ppl:.4f}")
-
-        trainer.save_model(epoch=epoch)
-
-        best_loss = trainer.metrics['val_loss'].min()
-        if val_loss < best_loss:
-            print(
-                f'New best model at epoch {epoch} with validation loss: {val_loss:.4f}')
-            trainer.save_model()  # Save as best model
-
-        print("Training completed successfully!")
-
-    else:
-        print("No checkpoint found, running full training...")
-        results = trainer.fit()
-        print(f"Training completed. Best results: {results}")
-
-    # Generate captions for a few validation images
+    # Train the model
     try:
-        print("\nGenerating sample captions...")
-        for i in range(min(3, len(val_ds))):
-            sample = val_ds[i]
-            if isinstance(val_ds, Subset):
-                sample_idx = val_ds.indices[i]
-                img_path = val_ds.dataset.df.iloc[sample_idx]['image']
-            else:
-                img_path = val_ds.df.iloc[i]['image']
+        results = trainer.fit(start_epoch=start_epoch)
+        print("\nTraining complete!")
+        print(f"Best validation loss: {results['best_loss']:.4f}")
+        print(f"Best perplexity: {results['best_perplexity']:.4f}")
+        print(f"Best epoch: {results['best_epoch']}")
 
-            caption = trainer.generate_caption(img_path)
-            print(f"Image: {os.path.basename(img_path)}")
-            print(f"Generated caption: {caption}")
+        # Final evaluation
+        print("\nGenerating sample captions with the best model...")
+        sample_images = [
+            os.path.join(images_folder, img)
+            for img in os.listdir(images_folder)[:5]
+            if img.endswith(('.jpg', '.jpeg', '.png'))
+        ]
+
+        for img_path in sample_images:
+            try:
+                caption = trainer.generate_caption(
+                    img_path,
+                    max_tokens=30,
+                    temperature=0.7
+                )
+                print(f"Image: {os.path.basename(img_path)}")
+                print(f"Caption: {caption}")
+                print("-" * 50)
+            except Exception as e:
+                print(f"Error generating caption for {img_path}: {e}")
+
+    except KeyboardInterrupt:
+        print("\nTraining interrupted. Saving current state...")
+        trainer.save_model(epoch="interrupted")
     except Exception as e:
-        print(f"Error generating captions: {e}")
+        print(f"Error during training: {e}")
+        # Save model in case of error
+        trainer.save_model(epoch="error")
+
+    print("Done!")
 
 
 if __name__ == "__main__":

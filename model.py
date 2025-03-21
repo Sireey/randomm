@@ -5,6 +5,13 @@ from transformers import GPT2LMHeadModel
 import timm
 
 
+def get_device():
+    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+device = get_device()
+
+
 class GPT2Attention(nn.Module):
     def __init__(self, config):
         super().__init__()
@@ -18,6 +25,7 @@ class GPT2Attention(nn.Module):
             self.embed_dim, self.head_size * self.n_heads * 3, bias=True)
         self.scale = self.head_size ** -0.5
 
+        # Register mask buffer that will be moved to the right device automatically
         self.register_buffer('mask', torch.tril(
             torch.ones(1, 1, self.seq_len, self.seq_len)))
 
@@ -141,10 +149,19 @@ class GPT2Block(nn.Module):
 
 
 class VisionGPT2Model(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, device=None):
         super().__init__()
 
         self.config = config
+
+        # Set device with priority to GPU if available
+        if device:
+            self.device = device
+        else:
+            self.device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu")
+
+        print(f"Using device: {self.device}")
 
         vit = timm.create_model('vit_base_patch16_224',
                                 pretrained=True, num_classes=0)
@@ -160,7 +177,6 @@ class VisionGPT2Model(nn.Module):
                                     for i in range(config.depth)])
 
         self.transformer = nn.ModuleDict(dict(
-            # Update vocab_size
             wte=nn.Embedding(config.vocab_size, config.embed_dim),
             wpe=nn.Embedding(config.seq_len, config.embed_dim),
             drop=nn.Dropout(config.emb_dropout),
@@ -170,6 +186,9 @@ class VisionGPT2Model(nn.Module):
         self.lm_head = nn.Linear(
             config.embed_dim, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # Tie weights
+
+        # Move model to device
+        self.to(self.device)
 
     def _pos_embed(self, x):
         pos_embed = self.pos_embed
@@ -201,25 +220,34 @@ class VisionGPT2Model(nn.Module):
             [p.numel() for p in self.parameters() if not p.requires_grad])
         print(f'{total_frozen_params=}')
 
-    def unfreeze_gpt_layers(self,):
-        gpt_layers = [[
-            self.transformer.h[i].ln_1, self.transformer.h[i].ln_2,
-            self.transformer.h[i].attn, self.transformer.h[i].mlp
-        ] for i in range(self.config.depth)]
-        flatten = []
-        for l in gpt_layers:
-            flatten.extend(l)
+    def unfreeze_last_gpt_block(self):
+        """Unfreezes the last GPT2 block."""
+        for param in self.transformer.h[-1].parameters():
+            param.requires_grad = True
+        print("Unfreezing last GPT2 block.")
 
-        for layer in flatten:
-            if not isinstance(layer, nn.Parameter):
-                for p in layer.parameters():
-                    p.requires_grad = True
-            else:
-                layer.requires_grad = True
+    def unfreeze_last_n_gpt_blocks(self, n):
+        """Unfreezes the last 'n' GPT2 blocks."""
+        for block in self.transformer.h[-n:]:
+            for param in block.parameters():
+                param.requires_grad = True
+        print(f"Unfreezing last {n} GPT2 blocks.")
+
+    def unfreeze_gpt_layers(self):
+        """Unfreezes all GPT2 layers."""
+        for block in self.transformer.h:
+            for param in block.parameters():
+                param.requires_grad = True
+        print("Unfreezing all GPT2 layers.")
 
     @classmethod
-    def from_pretrained(cls, config):
-        model = VisionGPT2Model(config)
+    def from_pretrained(cls, config, device=None):
+        # Add device parameter to from_pretrained
+        if device is None:
+            device = torch.device(
+                "cuda" if torch.cuda.is_available() else "cpu")
+
+        model = VisionGPT2Model(config, device=device)
         sd = model.state_dict()
         keys = sd.keys()
         ignore_matches = ['blocks.', 'cross_attn.', 'ln_3',
@@ -228,41 +256,60 @@ class VisionGPT2Model(nn.Module):
             match in key for match in ignore_matches)]
         gpt_keys = [key for key in keys if key not in vit_keys]
 
-        gpt2_small = GPT2LMHeadModel.from_pretrained('gpt2')
-        sd_hf = gpt2_small.state_dict()
-        hf_keys = sd_hf.keys()
-        hf_keys = [k for k in hf_keys if not k.endswith('.attn.masked_bias')]
-        hf_keys = [k for k in hf_keys if not k.endswith('.attn.bias')]
-        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
-                      'mlp.c_fc.weight', 'mlp.c_proj.weight']
+        try:
+            # Add warning message for potential large download
+            print("Downloading pretrained GPT2 weights (this might take a while)...")
+            gpt2_small = GPT2LMHeadModel.from_pretrained('gpt2')
+            print("Download complete.")
 
-        for k in hf_keys:
-            if any(match in k for match in ignore_matches):
-                continue
+            # Move the HF model to the same device
+            gpt2_small = gpt2_small.to(device)
 
-            # Skip embedding and output layers with shape mismatch (vocabulary differences)
-            if 'wte.weight' in k or 'lm_head.weight' in k:
-                continue
+            sd_hf = gpt2_small.state_dict()
+            hf_keys = sd_hf.keys()
+            hf_keys = [k for k in hf_keys if not k.endswith(
+                '.attn.masked_bias')]
+            hf_keys = [k for k in hf_keys if not k.endswith('.attn.bias')]
+            transposed = ['attn.c_attn.weight', 'attn.c_proj.weight',
+                          'mlp.c_fc.weight', 'mlp.c_proj.weight']
 
-            if any(k.endswith(w) for w in transposed):
-                if sd_hf[k].shape[::-1] == sd[k].shape:
-                    with torch.no_grad():
-                        sd[k].copy_(sd_hf[k].t())
-            else:
-                if sd_hf[k].shape == sd[k].shape:
-                    with torch.no_grad():
-                        sd[k].copy_(sd_hf[k])
+            for k in hf_keys:
+                if any(match in k for match in ignore_matches):
+                    continue
 
-        model.load_state_dict(sd)
+                # Skip embedding and output layers with shape mismatch (vocabulary differences)
+                if 'wte.weight' in k or 'lm_head.weight' in k:
+                    continue
+
+                if any(k.endswith(w) for w in transposed):
+                    if sd_hf[k].shape[::-1] == sd[k].shape:
+                        with torch.no_grad():
+                            sd[k].copy_(sd_hf[k].t())
+                else:
+                    if sd_hf[k].shape == sd[k].shape:
+                        with torch.no_grad():
+                            sd[k].copy_(sd_hf[k])
+
+            model.load_state_dict(sd)
+
+        except Exception as e:
+            print(f"Error loading pretrained weights: {e}")
+            print("Continuing with randomly initialized weights.")
 
         return model
 
     def forward(self, image, input_ids, labels=None):
+        # Make sure inputs are on the right device
+        image = image.to(self.device)
+        input_ids = input_ids.to(self.device)
+        if labels is not None:
+            labels = labels.to(self.device)
+
         image = self.patch_embed(image)
         image = self._pos_embed(image)
 
         token_embeddings = self.transformer.wte(input_ids)  # batch x seq_len
-        pos_embs = torch.arange(0, input_ids.size(1)).to(input_ids.device)
+        pos_embs = torch.arange(0, input_ids.size(1), device=self.device)
         positional_embeddings = self.transformer.wpe(pos_embs)
         input_ids = self.transformer.drop(
             token_embeddings + positional_embeddings)
@@ -283,16 +330,22 @@ class VisionGPT2Model(nn.Module):
         return lm_logits
 
     def generate(self, image, sequence, max_tokens=50, temperature=1.0, deterministic=False):
-        for _ in range(max_tokens):
-            out = self(image, sequence)
-            out = out[:, -1, :] / temperature
-            probs = F.softmax(out, dim=-1)
-            if deterministic:
-                next_token = torch.argmax(probs, dim=-1, keepdim=True)
-            else:
-                next_token = torch.multinomial(probs, num_samples=1)
-            sequence = torch.cat([sequence, next_token], dim=1)
-            if next_token.item() == self.config.eos_token_id:
-                break
+        # Ensure inputs are on the correct device
+        image = image.to(self.device)
+        sequence = sequence.to(self.device)
 
+        with torch.no_grad():  # Add no_grad() for generation to save memory
+            for _ in range(max_tokens):
+                out = self(image, sequence)
+                out = out[:, -1, :] / temperature
+                probs = F.softmax(out, dim=-1)
+                if deterministic:
+                    next_token = torch.argmax(probs, dim=-1, keepdim=True)
+                else:
+                    next_token = torch.multinomial(probs, num_samples=1)
+                sequence = torch.cat([sequence, next_token], dim=1)
+                if next_token.item() == self.config.eos_token_id:
+                    break
+
+        # Move result to CPU before returning to avoid keeping tensors on GPU unnecessarily
         return sequence.cpu().flatten()
