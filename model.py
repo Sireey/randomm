@@ -7,9 +7,29 @@ import timm
 
 def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# Define your config (example)
 
 
-device = get_device()
+class ModelConfig:
+    def __init__(self, tokenizer=None):
+        self.embed_dim = 768
+        self.num_heads = 12
+        self.seq_len = 1024
+        self.attention_dropout = 0.1
+        self.residual_dropout = 0.1
+        self.mlp_ratio = 4
+        self.mlp_dropout = 0.1
+        self.emb_dropout = 0.1
+        self.vocab_size = 25000
+
+        # Set vocab_size and eos_token_id based on tokenizer if provided
+        if tokenizer:
+
+            self.eos_token_id = tokenizer.eos_id
+        else:
+            # Default values (GPT2)
+            self.vocab_size = 50257
+            self.eos_token_id = 50256
 
 
 class GPT2Attention(nn.Module):
@@ -187,6 +207,10 @@ class VisionGPT2Model(nn.Module):
             config.embed_dim, config.vocab_size, bias=False)
         self.transformer.wte.weight = self.lm_head.weight  # Tie weights
 
+        # Initialize embedding weights properly
+        nn.init.normal_(self.transformer.wte.weight, mean=0.0, std=0.02)
+        nn.init.normal_(self.transformer.wpe.weight, mean=0.0, std=0.02)
+
         # Move model to device
         self.to(self.device)
 
@@ -239,6 +263,14 @@ class VisionGPT2Model(nn.Module):
             for param in block.parameters():
                 param.requires_grad = True
         print("Unfreezing all GPT2 layers.")
+
+    def unfreeze_word_embeddings(self):
+        """Unfreezes word embedding layer (important for custom tokenizers)."""
+        for param in self.transformer.wte.parameters():
+            param.requires_grad = True
+        for param in self.lm_head.parameters():
+            param.requires_grad = True
+        print("Unfreezing word embedding layers.")
 
     @classmethod
     def from_pretrained(cls, config, device=None):
@@ -298,54 +330,125 @@ class VisionGPT2Model(nn.Module):
 
         return model
 
-    def forward(self, image, input_ids, labels=None):
-        # Make sure inputs are on the right device
+    def forward(self, image, input_ids, attention_mask=None, labels=None):
         image = image.to(self.device)
         input_ids = input_ids.to(self.device)
+        if attention_mask is not None:
+            attention_mask = attention_mask.to(self.device)
         if labels is not None:
             labels = labels.to(self.device)
 
-        image = self.patch_embed(image)
-        image = self._pos_embed(image)
+        # ViT Processing
+        image_features = self.patch_embed(image)
+        image_features = self._pos_embed(image_features)
+        for block in self.blocks:
+            image_features = block(image_features)
 
-        token_embeddings = self.transformer.wte(input_ids)  # batch x seq_len
-        pos_embs = torch.arange(0, input_ids.size(1), device=self.device)
-        positional_embeddings = self.transformer.wpe(pos_embs)
-        input_ids = self.transformer.drop(
-            token_embeddings + positional_embeddings)
+        # GPT Embedding
+        token_embeddings = self.transformer.wte(input_ids)
+        positions = torch.arange(0, input_ids.size(1), device=self.device)
+        pos_embeddings = self.transformer.wpe(positions)
+        input_embedded = self.transformer.drop(
+            token_embeddings + pos_embeddings)
 
-        for i in range(self.config.depth):
-            image = self.blocks[i](image)
-            input_ids = self.transformer.h[i](input_ids, image)
+        # GPT Blocks with cross-attention
+        for block in self.transformer.h:
+            input_embedded = block(input_embedded, image_features)
 
-        input_ids = self.transformer.ln_f(input_ids)
+        input_embedded = self.transformer.ln_f(input_embedded)
+
+        lm_logits = self.lm_head(input_embedded)
 
         if labels is not None:
-            lm_logits = self.lm_head(input_ids)
-            loss = F.cross_entropy(
-                lm_logits.view(-1, lm_logits.shape[-1]), labels.view(-1))
+            labels_copy = labels.clone()
+
+            # Fix invalid negative labels
+            labels_copy[(labels_copy < 0) & (labels_copy != -100)] = -100
+
+            # Loss computation
+            loss_fct = nn.CrossEntropyLoss(ignore_index=-100)
+            loss = loss_fct(
+                lm_logits.view(-1, lm_logits.size(-1)), labels_copy.view(-1))
             return loss
 
-        lm_logits = self.lm_head(input_ids[:, [-1], :])
-        return lm_logits
+        return lm_logits  # Return logits for last token if no labels
 
     def generate(self, image, sequence, max_tokens=50, temperature=1.0, deterministic=False):
+        """
+        Generate text conditioned on image and prompt sequence
+
+        Args:
+            image: Image tensor [batch_size, channels, height, width]
+            sequence: Token IDs tensor [batch_size, seq_len]
+            max_tokens: Maximum number of tokens to generate
+            temperature: Sampling temperature (lower = more deterministic)
+            deterministic: If True, use argmax sampling instead of temperature
+
+        Returns:
+            Tensor of generated token IDs
+        """
+        # Cache the processed image to avoid recomputing for each token
+        self.eval()  # Set model to evaluation mode
+
         # Ensure inputs are on the correct device
         image = image.to(self.device)
         sequence = sequence.to(self.device)
 
-        with torch.no_grad():  # Add no_grad() for generation to save memory
+        # Process the image through ViT (can be cached for multiple generations)
+        with torch.no_grad():
+            image_features = self.patch_embed(image)
+            image_features = self._pos_embed(image_features)
+
+            # Process image through ViT blocks
+            for block in self.blocks:
+                image_features = block(image_features)
+
+        # Generate tokens one by one
+        with torch.no_grad():
             for _ in range(max_tokens):
-                out = self(image, sequence)
-                out = out[:, -1, :] / temperature
-                probs = F.softmax(out, dim=-1)
-                if deterministic:
-                    next_token = torch.argmax(probs, dim=-1, keepdim=True)
-                else:
-                    next_token = torch.multinomial(probs, num_samples=1)
-                sequence = torch.cat([sequence, next_token], dim=1)
-                if next_token.item() == self.config.eos_token_id:
+                # Ensure sequence is the right shape
+                if len(sequence.shape) == 1:
+                    sequence = sequence.unsqueeze(0)
+
+                # Forward pass with current sequence
+                try:
+                    # Explicitly pass labels=None to ensure correct method signature
+                    logits = self.forward(image, sequence, labels=None)
+                except Exception as e:
+                    print(f"Forward pass error: {e}")
                     break
 
-        # Move result to CPU before returning to avoid keeping tensors on GPU unnecessarily
-        return sequence.cpu().flatten()
+                # Handle different logits shapes
+                if logits is None:
+                    break
+
+                # Ensure logits are 3D
+                if len(logits.shape) == 2:
+                    logits = logits.unsqueeze(1)
+
+                # Get probabilities for the next token
+                try:
+                    # Always take the last token's logits
+                    next_token_logits = logits[:, -1, :] / temperature
+                    probs = F.softmax(next_token_logits, dim=-1)
+
+                    # Sample or take argmax
+                    if deterministic:
+                        next_token = torch.argmax(probs, dim=-1, keepdim=True)
+                    else:
+                        next_token = torch.multinomial(probs, num_samples=1)
+
+                    # Append new token to sequence
+                    sequence = torch.cat([sequence, next_token], dim=1)
+
+                    # Stop if EOS token is generated
+                    if next_token.item() == self.config.eos_token_id:
+                        break
+
+                except Exception as e:
+                    print(f"Generation step error: {e}")
+                    print(f"Logits shape: {logits.shape}")
+                    break
+
+        # Move result to CPU before returning
+        return sequence.cpu()
