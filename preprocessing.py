@@ -11,12 +11,10 @@ import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 # --- EDIT THESE PATHS FOR COLAB ---
-# Path to your captions file
-DATA_PATH = "/content/drive/MyDrive/randomm/Data/fl8telugu.txt"
-# Path to your images folder
-IMAGES_FOLDER = "/content/drive/MyDrive/randomm/Data/Images"
+DATA_PATH = "/content/drive/MyDrive/Data/fl8telugu.txt"  # Path to your captions file
+IMAGES_FOLDER = "/content/drive/MyDrive/Data/Images"  # Path to your images folder
 # Path to your tokenizer model
-TOKENIZER_PATH = "/content/drive/MyDrive/randomm/tokenizer.model"
+TOKENIZER_PATH = "/content/drive/MyDrive/Data/tokenizer.model"
 # ---------------------------------
 
 

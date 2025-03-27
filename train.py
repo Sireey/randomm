@@ -1,9 +1,3 @@
-from model import VisionGPT2Model, ModelConfig
-from preprocessing import (
-    prepare_telugu_captioning_datasets,
-    collate_fn,
-    SentencePieceTokenizer
-)
 import os
 import time
 import math
@@ -17,13 +11,19 @@ from torch.nn.utils import clip_grad_norm_
 import matplotlib.pyplot as plt
 from tqdm.notebook import tqdm
 from torch.optim.lr_scheduler import CosineAnnealingLR
+
 import sys
-sys.path.append('/content/drive/MyDrive/Project_files/')
+sys.path.append('/content/drive/MyDrive/Codes/')
+from preprocessing import (
+    prepare_telugu_captioning_datasets,
+    collate_fn,
+    SentencePieceTokenizer
+)
 
 # Import from model
+from model import VisionGPT2Model, ModelConfig
+
 # Set seeds for reproducibility
-
-
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
@@ -34,22 +34,20 @@ def set_seed(seed=42):
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
-
 # --- Configure these paths ---
-DATA_PATH = "/content/drive/MyDrive/randomm/Data/fl8telugu.txt"
-IMAGES_FOLDER = "/content/drive/MyDrive/randomm/Data/Images"
-TOKENIZER_PATH = "/content/drive/MyDrive/randomm/tokenizer.model"
-OUTPUT_DIR = "/content/drive/MyDrive/randomm/training_output"
+DATA_PATH = "/content/drive/MyDrive/Data/fl8telugu.txt"
+IMAGES_FOLDER = "/content/drive/MyDrive/Data/Images"
+TOKENIZER_PATH = "/content/drive/MyDrive/Data/tokenizer.model"
+OUTPUT_DIR = "/content/drive/MyDrive/training_output"
 # ---------------------------
 
 # Create output directory if it doesn't exist
 os.makedirs(OUTPUT_DIR, exist_ok=True)
+
 # Training configuration
-
-
 class TrainingConfig:
     def __init__(self):
-        self.max_samples = 500  # Limited sample size for initial training
+        self.max_samples = None  # Limited sample size for initial training
         self.batch_size = 8
         self.num_workers = 2
         self.num_epochs = 10
@@ -66,10 +64,8 @@ class TrainingConfig:
         self.log_interval = 20  # Log training stats every N steps
 
         # Set devices
-        self.device = torch.device(
-            "cuda" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.multi_gpu = torch.cuda.device_count() > 1
-
 
 def log_metrics(metrics, step, epoch=None, is_train=True, tb_writer=None):
     """Log training/validation metrics to console and tensorboard"""
@@ -84,7 +80,6 @@ def log_metrics(metrics, step, epoch=None, is_train=True, tb_writer=None):
     if tb_writer is not None:
         for k, v in metrics.items():
             tb_writer.add_scalar(f"{prefix}/{k}", v, step)
-
 
 def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, loss, config, tokenizer, filename):
     """Save training checkpoint"""
@@ -107,7 +102,6 @@ def save_checkpoint(model, optimizer, scheduler, scaler, epoch, step, loss, conf
     }
     torch.save(checkpoint, filename)
     print(f"Checkpoint saved to {filename}")
-
 
 def visualize_sample(model, tokenizer, val_dataset, device, idx=None, save_path=None):
     """Visualize a prediction on a sample from the validation dataset"""
@@ -136,8 +130,7 @@ def visualize_sample(model, tokenizer, val_dataset, device, idx=None, save_path=
     try:
         # Find where EOS token appears
         if tokenizer.eos_id in generated_ids:
-            generated_ids = generated_ids[:generated_ids.index(
-                tokenizer.eos_id)]
+            generated_ids = generated_ids[:generated_ids.index(tokenizer.eos_id)]
         generated_caption = tokenizer.decode(generated_ids)
     except:
         generated_caption = "[Error decoding tokens]"
@@ -169,10 +162,70 @@ def visualize_sample(model, tokenizer, val_dataset, device, idx=None, save_path=
     model.train()
     return generated_caption
 
+def load_checkpoint(checkpoint_path, model, optimizer, scheduler, config, scaler=None):
+    """
+    Load a training checkpoint and return the starting epoch, global step, and other states
 
-def train():
+    Args:
+        checkpoint_path (str): Path to the checkpoint file
+        model (nn.Module): Model to load state dict into
+        optimizer (Optimizer): Optimizer to load state dict
+        scheduler (LRScheduler): Learning rate scheduler to load state dict
+        config (TrainingConfig): Training configuration object
+        scaler (GradScaler, optional): Gradient scaler for mixed precision training
+
+    Returns:
+        dict: Dictionary containing training state information
+    """
+    checkpoint = torch.load(checkpoint_path)
+
+    # Load model state
+    if isinstance(model, torch.nn.DataParallel):
+        model.module.load_state_dict(checkpoint['model'])
+    else:
+        model.load_state_dict(checkpoint['model'])
+
+    # Load optimizer state
+    optimizer.load_state_dict(checkpoint['optimizer'])
+
+    # Load scheduler state if exists
+    if scheduler and checkpoint['scheduler']:
+        scheduler.load_state_dict(checkpoint['scheduler'])
+
+    # Load scaler state for mixed precision training
+    if scaler and checkpoint['scaler']:
+        scaler.load_state_dict(checkpoint['scaler'])
+
+    # Return key training states
+    return {
+        'start_epoch': checkpoint['epoch'],
+        'global_step': checkpoint['step'],
+        'best_val_loss': checkpoint.get('loss', float('inf')),
+        'teacher_forcing_ratio': checkpoint.get('teacher_forcing_ratio', config.teacher_forcing_ratio)
+    }
+
+def find_latest_checkpoint(checkpoint_dir):
+    """
+    Find the latest checkpoint in the given directory
+    """
+    # List all .pt files in the directory
+    checkpoints = [f for f in os.listdir(checkpoint_dir) if f.startswith('checkpoint_') and f.endswith('.pt')]
+
+    if not checkpoints:
+        return None
+
+    # Sort checkpoints by epoch number
+    latest_checkpoint = max(checkpoints, key=lambda x:
+        int(x.split('checkpoint_epoch')[1].split('.pt')[0])
+    )
+
+    return os.path.join(checkpoint_dir, latest_checkpoint)
+
+def train(resume_from_checkpoint=None):
     # Initialize configuration
     config = TrainingConfig()
+    if resume_from_checkpoint is None:
+        resume_from_checkpoint = find_latest_checkpoint('/content/drive/MyDrive/training_output')
     set_seed(42)
 
     # Load tokenizer
@@ -226,11 +279,9 @@ def train():
     model.unfreeze_last_n_gpt_blocks(3)  # Unfreeze last 3 GPT blocks
 
     # Count trainable parameters
-    trainable_params = sum(p.numel()
-                           for p in model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     total_params = sum(p.numel() for p in model.parameters())
-    print(
-        f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
+    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({trainable_params/total_params:.2%})")
 
     # Move model to device and setup multi-GPU if available
     if config.multi_gpu:
@@ -257,6 +308,28 @@ def train():
     # Training loop
     best_val_loss = float('inf')
     global_step = 0
+    start_epoch = 0
+
+    if resume_from_checkpoint and os.path.exists(resume_from_checkpoint):
+      print(f"Resuming training from checkpoint: {resume_from_checkpoint}")
+      resume_states = load_checkpoint(
+        resume_from_checkpoint,
+        model,
+        optimizer,
+        scheduler,
+        config,
+        scaler
+    )
+    start_epoch = resume_states['start_epoch']
+    global_step = resume_states['global_step']
+    best_val_loss = resume_states['best_val_loss']
+
+    # Restore teacher forcing ratio from checkpoint
+    config.teacher_forcing_ratio = resume_states['teacher_forcing_ratio']
+
+    print(f"Resuming from Epoch {start_epoch}, Global Step {global_step}")
+    print(f"Previous Best Validation Loss: {best_val_loss:.4f}")
+    print(f"Restored Teacher Forcing Ratio: {config.teacher_forcing_ratio:.4f}")
 
     try:
         for epoch in range(config.num_epochs):
@@ -272,8 +345,7 @@ def train():
             epoch_loss = 0
             start_time = time.time()
 
-            train_iterator = tqdm(
-                train_loader, desc=f"Training Epoch {epoch+1}")
+            train_iterator = tqdm(train_loader, desc=f"Training Epoch {epoch+1}")
             for step, batch in enumerate(train_iterator):
                 # Unpack batch
                 images, token_ids, labels, attention_mask = batch
@@ -318,8 +390,7 @@ def train():
                 # Log progress
                 if step % config.log_interval == 0 or step == len(train_loader) - 1:
                     avg_loss = epoch_loss / (step + 1)
-                    examples_per_sec = (
-                        step + 1) * config.batch_size / (time.time() - start_time)
+                    examples_per_sec = (step + 1) * config.batch_size / (time.time() - start_time)
                     lr = optimizer.param_groups[0]['lr']
 
                     metrics = {
@@ -340,8 +411,7 @@ def train():
                 # Evaluate periodically
                 if global_step % config.eval_every == 0:
                     print("\nGenerating sample caption...")
-                    sample_output_path = os.path.join(
-                        OUTPUT_DIR, f"sample_epoch{epoch+1}_step{global_step}.png")
+                    sample_output_path = os.path.join(OUTPUT_DIR, f"sample_epoch{epoch+1}_step{global_step}.png")
                     visualize_sample(
                         model.module if config.multi_gpu else model,
                         tokenizer,
@@ -372,8 +442,7 @@ def train():
                     val_attention_mask = val_attention_mask.to(config.device)
 
                     # Forward pass
-                    batch_loss = model(
-                        val_images, val_token_ids, val_attention_mask, val_labels)
+                    batch_loss = model(val_images, val_token_ids, val_attention_mask, val_labels)
                     val_loss += batch_loss.item()
                     val_steps += 1
 
@@ -382,8 +451,7 @@ def train():
 
             # Save checkpoint
             if (epoch + 1) % config.save_every == 0:
-                checkpoint_path = os.path.join(
-                    OUTPUT_DIR, f"checkpoint_epoch{epoch+1}.pt")
+                checkpoint_path = os.path.join(OUTPUT_DIR, f"checkpoint_epoch{epoch+1}.pt")
                 save_checkpoint(
                     model.module if config.multi_gpu else model,
                     optimizer,
@@ -413,8 +481,7 @@ def train():
                     tokenizer,
                     best_model_path
                 )
-                print(
-                    f"New best model saved with validation loss: {best_val_loss:.4f}")
+                print(f"New best model saved with validation loss: {best_val_loss:.4f}")
 
             # Generate sample captions
             print("\nGenerating sample captions...")
@@ -460,7 +527,6 @@ def train():
     )
 
     return model, tokenizer
-
 
 if __name__ == "__main__":
     # Check if CUDA is available
